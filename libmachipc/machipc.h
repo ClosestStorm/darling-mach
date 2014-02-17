@@ -1,6 +1,6 @@
 #ifndef MACHIPC_H
 #define MACHIPC_H
-#include "../linuxmach.h"
+#include "../kernel/linuxmach_user.h"
 
 #ifdef __cplusplus
 extern "C" {

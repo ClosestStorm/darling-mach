@@ -2,9 +2,13 @@
 #include <linux/module.h>
 #include <linux/miscdevice.h>
 #include <linux/fs.h>
-#include <linux/security.h>
+#include <linux/slab.h>
+#include <linux/sched.h>
+#include <linux/syscalls.h>
+#include <linux/idr.h>
 #include "mach_ports.h"
 #include "linuxmach.h"
+#include "linuxmach_user.h"
 
 MODULE_LICENSE("GPL");
 
@@ -25,12 +29,9 @@ static const syscall_handler syscalls[] = {
 	(syscall_handler) mach_port_allocate, // 1
 	(syscall_handler) mach_port_deallocate // 2
 };
-static struct security_operations watched_ops = {
-	.task_create = task_create_hook,
-	.task_free = task_free_hook
-};
 
-//#define mach_MINOR 1
+static LIST_HEAD(list_ports); // TODO: change to rbtree (needed for task_for_pid())
+static DEFINE_SPINLOCK(lock_ports);
 
 static struct miscdevice mach_dev = {
 	MISC_DYNAMIC_MINOR,
@@ -40,18 +41,7 @@ static struct miscdevice mach_dev = {
 
 static int mach_init(void)
 {
-	//printk(KERN_ALERT "Linux Mach kernel emulation loaded\n");
-
-	int err = register_security(&watched_ops);
-	if (err == -EAGAIN)
-	{
-		printk(KERN_WARNING "Darling Mach kernel emulation failed to load.\n");
-		printk(KERN_WARNING "You seem to have another LSM such as SELinux loaded. This is currently not supported.\n");
-	}
-	if (err < 0)
-		goto fail;
-
-	err = misc_register(&mach_dev);
+	int err = misc_register(&mach_dev);
 	if (err < 0)
 		goto fail;
 
@@ -64,24 +54,92 @@ fail:
 }
 static void mach_exit(void)
 {
-	reset_security_ops();
 	misc_deregister(&mach_dev);
 	printk(KERN_INFO "Darling Mach kernel emulation unloaded\n");
 }
 
 int mach_dev_open(struct inode* ino, struct file* file)
 {
+	struct mach_task_data* mpdata = NULL;
+	struct mach_port* task_port = NULL;
+	int err;
+
+	mpdata = (struct mach_task_data*)
+		kmalloc(sizeof(struct mach_task_data), GFP_KERNEL);
+
+	if (mpdata == NULL)
+	{
+		err = -ENOSPC;
+		goto fail;
+	}
+
+	task_port = (struct mach_port*)
+		kmalloc(sizeof(struct mach_port), GFP_KERNEL);
+
+	if (task_port == NULL)
+	{
+		err = -ENOSPC;
+		goto fail;
+	}
+
+	file->private_data = mpdata;
+	mpdata->task_id = current->tgid;
+
+	idr_init(&mpdata->port_rights);
+
+	// TODO: move some of the logic into mach_port_insert_right
+	
+	task_port->type = PORT_TYPE_TASK;
+	task_port->task.pid = current->tgid;
+	atomic_set(&task_port->refs, 1);
+
+	do
+	{
+		if (!idr_pre_get(&mpdata->port_rights, GFP_KERNEL))
+		{
+			err = -ENOSPC;
+			goto fail;
+		}
+
+		err = idr_get_new(&mpdata->port_rights, task_port, &mpdata->task_self);
+	}
+	while (err == -EAGAIN);
+
+	spin_lock(&lock_ports);
+	list_add(&task_port->list, &list_ports);
+	spin_unlock(&lock_ports);
+
 	return 0;
+fail:
+
+	if (mpdata != NULL)
+		kfree(mpdata);
+
+	return err;
 }
 
 int mach_dev_release(struct inode* ino, struct file* file)
 {
+	// TODO: change the task port type to dead (and later thread ports as well)
+	// TODO: unref all ports this task has rights to
+	kfree(file->private_data);
 	return 0;
 }
 
 long mach_dev_ioctl(struct file* file, unsigned int ioctl_num, unsigned long ioctl_paramv)
 {
+	struct mach_task_data* mpdata = (struct mach_task_data*) file->private_data;
 	const unsigned int num_syscalls = sizeof(syscalls) / sizeof(syscalls[0]);
+
+	if (mpdata->task_id != current->tgid)
+	{
+		/*
+		 * The user-space implementation should have re-opened /dev/mach to get a new fd
+		 * after fork()
+		 */
+
+		return -EBADF;
+	}
 	
 	if (ioctl_num > num_syscalls)
 		return -ENOSYS;
@@ -92,14 +150,6 @@ long mach_dev_ioctl(struct file* file, unsigned int ioctl_num, unsigned long ioc
 	return syscalls[ioctl_num-1](file->private_data, ioctl_paramv);
 }
 
-int task_create_hook(unsigned long clone_flags)
-{
-	return 0;
-}
-
-void task_free_hook(struct task_struct *task)
-{
-}
-
 module_init(mach_init);
 module_exit(mach_exit);
+
